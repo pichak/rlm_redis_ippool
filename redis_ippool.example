@@ -1,0 +1,26 @@
+# -*- text -*-
+#
+#  $Id: e16550c9991a5e76a77f349cfa5b82d5163f172e $
+
+#
+#  Configuration file for the "rediswho" module.
+#
+redis_ippool {
+
+	#  Expiry time in seconds.
+	expire-time = 3600
+
+	ip-key = "%{NAS-Port}"
+
+	max-collision-retry = 10
+
+	allocate-check = "GET %{NAS-IP-Address}_${proposed-ip}"
+	allocate = "SET %{NAS-IP-Address}_${proposed-ip} 1 \n EXPIRE %{NAS-IP-Address}_%{proposed-ip} ${expire-time}"
+
+	allocate-update = "EXPIRE %{NAS-IP-Address}_%{Framed-IP-Address} ${expire-time}"
+
+	deallocate = "DEL %{NAS-IP-Address}_%{Framed-IP-Address}"
+}
+
+
+SET expire_pool "10.13.0.0 10.13.255.255"
