@@ -13,6 +13,8 @@
  *   Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
  */
 
+#include <freeradius-devel/ident.h>
+
 /**
  * $Id: 3b250c4f890164d0e35f54e9d9319f280942a0df $
  * @file rlm_redis_ippool.c
@@ -26,12 +28,11 @@ RCSID("$Id: 3b250c4f890164d0e35f54e9d9319f280942a0df $")
 #include <freeradius-devel/radiusd.h>
 #include <freeradius-devel/modules.h>
 
-#include <freeradius-devel/ident.h>
-
 #include <ctype.h>
 
 #include <string.h>
 #include <stdlib.h>
+#include <stdio.h>
 
 #include <rlm_redis.h>
 
@@ -53,9 +54,11 @@ typedef struct rlm_redis_ippool_t {
 	int max_collision_retry;
 
 	/*
-	 * 	expiry time in seconds if no updates are received for a user
+	 * 	expire time in seconds if no updates are received for a user
 	 */
-	int expiry_time; 
+	int expire_time;
+
+	char *get_pool_range;
 
 	char *allocate_check;
 	char *allocate;
@@ -76,10 +79,13 @@ static const CONF_PARSER module_config[] = {
 	  offsetof(rlm_redis_ippool_t, ip_key), NULL, ""},
 
 	{ "max-collision-retry", PW_TYPE_INTEGER,
-	  offsetof(rlm_redis_ippool_t, ip_key), NULL, "4"},
+	  offsetof(rlm_redis_ippool_t, max_collision_retry), NULL, "4"},
 
-	{ "expiry-time", PW_TYPE_INTEGER,
-	  offsetof(rlm_redis_ippool_t, expiry_time), NULL, "3600"},
+	{ "expire-time", PW_TYPE_INTEGER,
+	  offsetof(rlm_redis_ippool_t, expire_time), NULL, "3600"},
+
+	{ "get-pool-range", PW_TYPE_STRING_PTR,
+	  offsetof(rlm_redis_ippool_t, get_pool_range), NULL, ""},
 
 	{ "allocate-check", PW_TYPE_STRING_PTR,
 	  offsetof(rlm_redis_ippool_t, allocate_check), NULL, ""},
@@ -129,11 +135,10 @@ static int redis_ippool_command(const char *fmt, REDISSOCK *dissocket,
 		break;
 	}
 
-	(data->redis_inst->redis_finish_query)(dissocket);
-
 	return result;
 }
 
+static int redis_ippool_detach(UNUSED void *instance);
 
 /*
  *	Do any per-module initialization that is separate to each
@@ -145,7 +150,7 @@ static int redis_ippool_command(const char *fmt, REDISSOCK *dissocket,
  *	that must be referenced in later calls, store a handle to it
  *	in *instance otherwise put a null pointer there.
  */
-static int mod_instantiate(CONF_SECTION *conf, void *instance)
+static int redis_ippool_instantiate(CONF_SECTION *conf, void **instance)
 {
 	module_instance_t *modinst;
 	rlm_redis_ippool_t *inst;
@@ -165,65 +170,6 @@ static int mod_instantiate(CONF_SECTION *conf, void *instance)
 		return -1;
 	}
 
-	inst->xlat_name = cf_section_name2(conf);
-
-	if (!inst->xlat_name) 
-		inst->xlat_name = cf_section_name1(conf);
-
-	inst->xlat_name = strdup(inst->xlat_name);
-
-	DEBUG("xlat name %s\n", inst->xlat_name);
-
-	/*
-	 *	Check that all the queries are in place
-	 */
-	if ((inst->start_insert == NULL) || !*inst->start_insert) {
-		radlog(L_ERR, "rlm_redis_ippool: the 'start_insert' statement must be set.");
-		mod_detach(inst);
-		return -1;
-	}
-	if ((inst->start_trim == NULL) || !*inst->start_trim) {
-		radlog(L_ERR, "rlm_redis_ippool: the 'start_trim' statement must be set.");
-		mod_detach(inst);
-		return -1;
-	}
-	if ((inst->start_expire == NULL) || !*inst->start_expire) {
-		radlog(L_ERR, "rlm_redis_ippool: the 'start_expire' statement must be set.");
-		mod_detach(inst);
-		return -1;
-	}
-
-	if ((inst->alive_insert == NULL) || !*inst->alive_insert) {
-		radlog(L_ERR, "rlm_redis_ippool: the 'alive_insert' statement must be set.");
-		mod_detach(inst);
-		return -1;
-	}
-	if ((inst->alive_trim == NULL) || !*inst->alive_trim) {
-		radlog(L_ERR, "rlm_redis_ippool: the 'alive_trim' statement must be set.");
-		mod_detach(inst);
-		return -1;
-	}
-	if ((inst->alive_expire == NULL) || !*inst->alive_expire) {
-		radlog(L_ERR, "rlm_redis_ippool: the 'alive_expire' statement must be set.");
-		mod_detach(inst);
-		return -1;
-	}
-
-	if ((inst->stop_insert == NULL) || !*inst->stop_insert) {
-		radlog(L_ERR, "rlm_redis_ippool: the 'stop_insert' statement must be set.");
-		mod_detach(inst);
-		return -1;
-	}
-	if ((inst->stop_trim == NULL) || !*inst->stop_trim) {
-		radlog(L_ERR, "rlm_redis_ippool: the 'stop_trim' statement must be set.");
-		mod_detach(inst);
-		return -1;
-	}
-	if ((inst->stop_expire == NULL) || !*inst->stop_expire) {
-		radlog(L_ERR, "rlm_redis_ippool: the 'stop_expire' statement must be set.");
-		mod_detach(inst);
-		return -1;
-	}
 
 	modinst = find_module_instance(cf_section_find("modules"),
 				       inst->redis_instance_name, 1);
@@ -232,7 +178,7 @@ static int mod_instantiate(CONF_SECTION *conf, void *instance)
 		       "redis_ippool: failed to find module instance \"%s\"",
 		       inst->redis_instance_name);
 
-		mod_detach(inst);
+		redis_ippool_detach(inst);
 		return -1;
 	}
 
@@ -241,7 +187,7 @@ static int mod_instantiate(CONF_SECTION *conf, void *instance)
 		       " is not an instance of the redis module",
 		       inst->redis_instance_name);
 
-		mod_detach(inst);
+		redis_ippool_detach(inst);
 		return -1;
 	}
 
@@ -275,21 +221,23 @@ static char* get_ip_str(long start[4], long ip_key){
 	ip_key += start[0];
 	ip_a = ip_key;
 
-	if (ip_c == 0 and ip_d == 0)
+	if (ip_c == 0 && ip_d == 0)
 		ip_d = 1;
 
 	char result[100];
 	sprintf(result, "%d.%d.%d.%d", ip_a, ip_b, ip_c, ip_d);
 
-	return &result;
+	return result;
 }
 
-static bool is_ip_available(ip_str, dissocket, data, request){
+static int is_ip_available(char *ip_str, REDISSOCK *dissocket,rlm_redis_ippool_t *data, REQUEST *request){
+	int rc;
 
 	VALUE_PAIR *proposed_ip;
-	proposed_ip = pairmake("proposed-ip", ip_str, T_OP_SET);
-	pairadd(&request->control->vps, proposed_ip);
+	proposed_ip = pairmake("Framed-IP-Address", ip_str, T_OP_SET);
+	pairadd(&request->reply->vps, proposed_ip);
 	REDIS_COMMAND(data->allocate_check, dissocket, data, request);
+	(data->redis_inst->redis_finish_query)(dissocket);
 
 	return strcmp(dissocket->reply->str, '(nil)') == 0;
 }
@@ -298,12 +246,13 @@ static bool is_ip_available(ip_str, dissocket, data, request){
 /*
  *	Allocate an IP number from the pool.
  */
-static int mod_post_auth(void * instance, REQUEST * request)
+static int redis_ippool_post_auth(void * instance, REQUEST * request)
 {
+	int rc;
 	int rcode = RLM_MODULE_NOOP;
 	VALUE_PAIR * vp;
 	int acct_status_type;
-	rlm_sqlippool_t * data = (rlm_sqlippool_t *) instance;
+	rlm_redis_ippool_t * data = (rlm_redis_ippool_t *) instance;
 	REDISSOCK *dissocket;
 	
 	char *pool_name = NULL;
@@ -312,13 +261,13 @@ static int mod_post_auth(void * instance, REQUEST * request)
 	/*
 	 *	If there is a Framed-IP-Address attribute in the reply do nothing
 	 */
-	if (pairfind(request->reply->vps, PW_FRAMED_IP_ADDRESS, 0, TAG_ANY) != NULL) {
+	if (pairfind(request->reply->vps, PW_FRAMED_IP_ADDRESS) != NULL) {
 		RDEBUG("Framed-IP-Address already exists");
 
 		return RLM_MODULE_NOOP;
 	}
 
-	if ((vp = pairfind(request->config_items, PW_POOL_NAME, 0, TAG_ANY)) == NULL) {
+	if ((vp = pairfind(request->config_items, PW_POOL_NAME)) == NULL) {
 		RDEBUG("No Pool-Name defined");
 
 		return RLM_MODULE_NOOP;
@@ -332,11 +281,7 @@ static int mod_post_auth(void * instance, REQUEST * request)
 		return RLM_MODULE_FAIL;
 	}
 
-	char *get_pool_iprange_query[100];
-	strcpy(get_pool_iprange_query,  "GET ");
-	strcat(get_pool_iprange_query, pool_name);
-
-	REDIS_COMMAND(get_pool_iprange_query, dissocket, data, request);
+	REDIS_COMMAND(data->get_pool_range, dissocket, data, request);
 	pool_ip_range = dissocket->reply->str;
 
 	if (strcmp(pool_ip_range, "(nil)") == 0){
@@ -346,55 +291,34 @@ static int mod_post_auth(void * instance, REQUEST * request)
 	}
 
 	// parse ip_range
-	long start[4];
-	char *tempNumber = pool_ip_range;
-	char *tmp = pool_ip_range;
+	int start[4];
+	int end[4];
+	int iprange_parsed = sscanf(pool_ip_range, "%d.%d.%d.%d %d.%d.%d.%d", start, start+1, start+2, start+3, end, end+1, end+2, end+3);
+	if (iprange_parsed != 8){
+		if (strcmp(pool_ip_range, "(nil)") == 0){
+			RDEBUG("Pool '%s' ip range is invalid",pool_name);
 
-	int ip_position_index = 0;
-	int i = 0;
-	while (tmp){
-		start[ip_position_index] = strtol(tempNumber, &tmp, 10)
-		ip_position_index++;
-
-		if (ip_position_index > 4);
-			break;
-
-		if (*tmp == '.')
-			tmp++;
-	}
-
-	if (*tmp == ' ')
-			tmp++;
-
-	long end[4];
-	ip_position_index = 0;
-	while (tmp){
-		end[ip_position_index] = strtol(tempNumber, &tmp, 10)
-		ip_position_index++;
-
-		if (ip_position_index > 4);
-			break;
-
-		if (*tmp == '.')
-			tmp++;
+			return RLM_MODULE_NOOP;
+		}
 	}
 
 	// calc ip range length
-	long range_length = (end[0]-start[0])*(255*255*255) + (end[1]-start[1])*(255*255) + (end[2]-start[2])*(255) + end[3]-start[3];
+	long range_length = (long)(end[0]-start[0])*(255*255*255) + (end[1]-start[1])*(255*255) + (end[2]-start[2])*(255) + end[3]-start[3];
 
 	long ip_key = data->ip_key;
 
 	ip_key %= range_length;
 
 	long ip[4];
-	char ip_str[100];
-	bool ip_found = false;
+	char *ip_str;
+	int ip_found = 0;
 
-	for (int i = 0; i < data->max_collision_retry; ++i)
+	int i;
+	for (i = 0; i < data->max_collision_retry; ++i)
 	{
 		ip_str = get_ip_str(start, ip_key);
 		if (is_ip_available(ip_str, dissocket, data, request)){
-			ip_found = true;
+			ip_found = 1;
 			break;
 		}else{
 			ip_key += rand();
@@ -402,14 +326,20 @@ static int mod_post_auth(void * instance, REQUEST * request)
 		}
 	}
 
-	if (!ip_found)
+	if (!ip_found){
+		RDEBUG("Failed to find free ip from pool '%s'",pool_name);
 		return RLM_MODULE_FAIL;
+	}
+
+	// finish query
+	(data->redis_inst->redis_finish_query)(dissocket);
 
 	// allocate ip address
 	VALUE_PAIR *proposed_ip;
-	proposed_ip = pairmake("proposed-ip", ip_str, T_OP_SET);
-	pairadd(&request->control->vps, proposed_ip);
+	proposed_ip = pairmake("Framed-IP-Address", ip_str, T_OP_SET);
+	pairadd(&request->reply->vps, proposed_ip);
 	REDIS_COMMAND(data->allocate, dissocket, data, request);
+	(data->redis_inst->redis_finish_query)(dissocket);
 
 	VALUE_PAIR *framed_ip_address;
 	framed_ip_address = pairmake("Framed-IP-Address", ip_str, T_OP_SET);
@@ -424,12 +354,13 @@ static int mod_post_auth(void * instance, REQUEST * request)
 /*
  *	Check for an Accounting-Stop to deallocate ip or Accounting-Update to update ip's time to live
  */
-static int mod_accounting(void * instance, REQUEST * request)
+static int redis_ippool_accounting(void * instance, REQUEST * request)
 {
+	int rc;
 	int rcode = RLM_MODULE_NOOP;
 	VALUE_PAIR * vp;
 	int acct_status_type;
-	rlm_sqlippool_t * data = (rlm_sqlippool_t *) instance;
+	rlm_redis_ippool_t * data = (rlm_redis_ippool_t *) instance;
 	REDISSOCK *dissocket;
 
 	vp = pairfind(request->packet->vps, PW_ACCT_STATUS_TYPE);
@@ -462,16 +393,19 @@ static int mod_accounting(void * instance, REQUEST * request)
 	switch (acct_status_type) {
         case PW_STATUS_START:
         REDIS_COMMAND(data->allocate_update, dissocket, data, request);
+        (data->redis_inst->redis_finish_query)(dissocket);
 		rcode = RLM_MODULE_OK;
 		break;
 
         case PW_STATUS_ALIVE:
 		REDIS_COMMAND(data->allocate_update, dissocket, data, request);
+		(data->redis_inst->redis_finish_query)(dissocket);
 		rcode = RLM_MODULE_OK;
 		break;
 
         case PW_STATUS_STOP:
 		REDIS_COMMAND(data->deallocate, dissocket, data, request);
+		(data->redis_inst->redis_finish_query)(dissocket);
 		rcode = RLM_MODULE_OK;
 		break;
 
@@ -492,9 +426,9 @@ static int mod_accounting(void * instance, REQUEST * request)
  *	Only free memory we allocated.  The strings allocated via
  *	cf_section_parse() do not need to be freed.
  */
-static int mod_detach(UNUSED void *instance)
+static int redis_ippool_detach(UNUSED void *instance)
 {
-	rlm_sqlippool_t *inst;
+	rlm_redis_ippool_t *inst;
 
 	inst = instance;
 	free(inst);
@@ -515,18 +449,16 @@ module_t rlm_redis_ippool = {
 	RLM_MODULE_INIT,
 	"redis_ippool",
 	RLM_TYPE_THREAD_SAFE,		/* type */
-	sizeof(rlm_redis_ippool_t),
-	module_config,
-	mod_instantiate,		/* instantiation */
-	mod_detach,			/* detach */
+	redis_ippool_instantiate,		/* instantiation */
+	redis_ippool_detach,			/* detach */
 	{
 		NULL,			/* authentication */
 		NULL,		 	/* authorization */
 		NULL,			/* preaccounting */
-		mod_accounting,	/* accounting */
+		redis_ippool_accounting,	/* accounting */
 		NULL,			/* checksimul */
 		NULL,			/* pre-proxy */
 		NULL,			/* post-proxy */
-		mod_post_auth		/* post-auth */
+		redis_ippool_post_auth		/* post-auth */
 	},
 };
