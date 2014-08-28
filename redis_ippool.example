@@ -14,10 +14,11 @@ redis_ippool {
 
 	max-collision-retry = 10
 
-	get-pool-range = "GET \"%{Pool-Name}\""
+	get-pool-range = "GET \"%{control:Pool-Name}\""
 
+	# Proposed IP address will store in %{Framed-IP-Address}
 	allocate-check = "GET \"%{NAS-IP-Address}_%{Framed-IP-Address}\""
-	allocate = "SET \"%{NAS-IP-Address}_%{Framed-IP-Address}\" 1 \n EXPIRE \"%{NAS-IP-Address}_%{proposed-ip}\" ${expire-time}"
+	allocate = "SET \"%{NAS-IP-Address}_%{Framed-IP-Address}\" 1"
 
 	allocate-update = "EXPIRE \"%{NAS-IP-Address}_%{Framed-IP-Address}\" ${expire-time}"
 

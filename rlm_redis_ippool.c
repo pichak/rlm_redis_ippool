@@ -49,7 +49,7 @@ typedef struct rlm_redis_ippool_t {
 	char *redis_instance_name;
 	REDIS_INST *redis_inst;
 
-	int ip_key;
+	char *ip_key;
 
 	int max_collision_retry;
 
@@ -75,7 +75,7 @@ static const CONF_PARSER module_config[] = {
 	{ "redis-instance-name", PW_TYPE_STRING_PTR,
 	  offsetof(rlm_redis_ippool_t, redis_instance_name), NULL, "redis"},
 
-	{ "ip-key", PW_TYPE_INTEGER,
+	{ "ip-key", PW_TYPE_STRING_PTR,
 	  offsetof(rlm_redis_ippool_t, ip_key), NULL, ""},
 
 	{ "max-collision-retry", PW_TYPE_INTEGER,
@@ -112,10 +112,23 @@ static int redis_ippool_command(const char *fmt, REDISSOCK *dissocket,
 {
 	int result = 0;
 
-	if (data->redis_inst->redis_query(dissocket, data->redis_inst,
-	                                  fmt, request) < 0) {
+	char query[1000];
 
-		radlog(L_ERR, "redis_ippool_command: database query error in: '%s'", fmt);
+	/*
+	 * Do an xlat on the provided string
+	 */
+	if (request) {
+		if (!radius_xlat(query, sizeof(query), fmt, request, NULL)) {
+			radlog(L_ERR, "redis_ippool_command: xlat failed on: '%s'", fmt);
+			return 0;
+		}
+	} else {
+		strcpy(query, fmt);
+	}
+
+	if (data->redis_inst->redis_query(dissocket, data->redis_inst, query, request) < 0) {
+
+		radlog(L_ERR, "redis_ippool_command: database query error in: '%s'", query);
 		return -1;
 	}
 
@@ -200,7 +213,7 @@ static int redis_ippool_instantiate(CONF_SECTION *conf, void **instance)
 #define REDIS_COMMAND(_a, _b, _c, _d) rc = redis_ippool_command(_a, _b, _c, _d); if (rc < 0) return RLM_MODULE_FAIL
 
 
-static char* get_ip_str(long start[4], long ip_key){
+static void get_ip_str(int start[4], long ip_key, char* ip_str){
 	long ip_a, ip_b, ip_c, ip_d;
 	
 	ip_key += start[3];
@@ -224,22 +237,36 @@ static char* get_ip_str(long start[4], long ip_key){
 	if (ip_c == 0 && ip_d == 0)
 		ip_d = 1;
 
-	char result[100];
-	sprintf(result, "%d.%d.%d.%d", ip_a, ip_b, ip_c, ip_d);
-
-	return result;
+	sprintf(ip_str, "%ld.%ld.%ld.%ld", ip_a, ip_b, ip_c, ip_d);
 }
 
 static int is_ip_available(char *ip_str, REDISSOCK *dissocket,rlm_redis_ippool_t *data, REQUEST *request){
 	int rc;
 
-	VALUE_PAIR *proposed_ip;
-	proposed_ip = pairmake("Framed-IP-Address", ip_str, T_OP_SET);
-	pairadd(&request->reply->vps, proposed_ip);
+	VALUE_PAIR *vp;
+
+	if (pairfind(request->packet->vps, PW_FRAMED_IP_ADDRESS) != NULL) {
+		pairdelete(&request->packet->vps, PW_FRAMED_IP_ADDRESS);
+	}
+
+	fr_ipaddr_t ipaddr;
+	uint32_t ip_allocation;
+	if ((ip_hton(ip_str, AF_INET, &ipaddr) < 0) || ((ip_allocation = ipaddr.ipaddr.ip4addr.s_addr) == INADDR_NONE)) {
+		RDEBUG("Invalid IP number [%s] returned from database query.", ip_str);
+		return 0;
+	}
+
+	vp = radius_paircreate(request, &request->packet->vps,PW_FRAMED_IP_ADDRESS, PW_TYPE_IPADDR);
+	vp->vp_ipaddr = ip_allocation;
+	
 	REDIS_COMMAND(data->allocate_check, dissocket, data, request);
+
+
+	int result = dissocket->reply->type == 4; // 4 == REDIS_REPLY_NIL
+
 	(data->redis_inst->redis_finish_query)(dissocket);
 
-	return strcmp(dissocket->reply->str, '(nil)') == 0;
+	return result;
 }
 
 
@@ -249,9 +276,7 @@ static int is_ip_available(char *ip_str, REDISSOCK *dissocket,rlm_redis_ippool_t
 static int redis_ippool_post_auth(void * instance, REQUEST * request)
 {
 	int rc;
-	int rcode = RLM_MODULE_NOOP;
 	VALUE_PAIR * vp;
-	int acct_status_type;
 	rlm_redis_ippool_t * data = (rlm_redis_ippool_t *) instance;
 	REDISSOCK *dissocket;
 	
@@ -284,7 +309,7 @@ static int redis_ippool_post_auth(void * instance, REQUEST * request)
 	REDIS_COMMAND(data->get_pool_range, dissocket, data, request);
 	pool_ip_range = dissocket->reply->str;
 
-	if (strcmp(pool_ip_range, "(nil)") == 0){
+	if (dissocket->reply->type == 4){ // 4 == REDIS_REPLY_NIL
 		RDEBUG("Pool with name '%s' not found",pool_name);
 
 		return RLM_MODULE_NOOP;
@@ -295,33 +320,45 @@ static int redis_ippool_post_auth(void * instance, REQUEST * request)
 	int end[4];
 	int iprange_parsed = sscanf(pool_ip_range, "%d.%d.%d.%d %d.%d.%d.%d", start, start+1, start+2, start+3, end, end+1, end+2, end+3);
 	if (iprange_parsed != 8){
-		if (strcmp(pool_ip_range, "(nil)") == 0){
-			RDEBUG("Pool '%s' ip range is invalid",pool_name);
+		RDEBUG("'%s' ip range is invalid",pool_name);
 
-			return RLM_MODULE_NOOP;
-		}
+		return RLM_MODULE_NOOP;
 	}
+
+	// finish query
+	(data->redis_inst->redis_finish_query)(dissocket);
 
 	// calc ip range length
 	long range_length = (long)(end[0]-start[0])*(255*255*255) + (end[1]-start[1])*(255*255) + (end[2]-start[2])*(255) + end[3]-start[3];
 
-	long ip_key = data->ip_key;
+
+	// expand ip-key
+	char ip_key_str[100];
+	if (!radius_xlat(ip_key_str, sizeof(ip_key_str), data->ip_key, request, NULL)) {
+		radlog(L_ERR, "xlat failed on: '%s'", data->ip_key);
+		return 0;
+	}
+
+	RDEBUG("ip-key is: %s", ip_key_str);
+
+	long ip_key;
+	sscanf(ip_key_str, "%ld", &ip_key);
 
 	ip_key %= range_length;
 
-	long ip[4];
-	char *ip_str;
+	char ip_str[100];
 	int ip_found = 0;
 
 	int i;
 	for (i = 0; i < data->max_collision_retry; ++i)
 	{
-		ip_str = get_ip_str(start, ip_key);
+		get_ip_str(start, ip_key, ip_str);
 		if (is_ip_available(ip_str, dissocket, data, request)){
 			ip_found = 1;
 			break;
 		}else{
 			ip_key += rand();
+			RDEBUG("collision detected. change ip-key to: %ld", ip_key);
 			ip_key %= range_length;
 		}
 	}
@@ -331,19 +368,26 @@ static int redis_ippool_post_auth(void * instance, REQUEST * request)
 		return RLM_MODULE_FAIL;
 	}
 
-	// finish query
-	(data->redis_inst->redis_finish_query)(dissocket);
-
 	// allocate ip address
-	VALUE_PAIR *proposed_ip;
-	proposed_ip = pairmake("Framed-IP-Address", ip_str, T_OP_SET);
-	pairadd(&request->reply->vps, proposed_ip);
 	REDIS_COMMAND(data->allocate, dissocket, data, request);
 	(data->redis_inst->redis_finish_query)(dissocket);
 
-	VALUE_PAIR *framed_ip_address;
-	framed_ip_address = pairmake("Framed-IP-Address", ip_str, T_OP_SET);
-	pairadd(&request->reply->vps, framed_ip_address);
+	// set allocated ip ttl
+	REDIS_COMMAND(data->allocate_update, dissocket, data, request);
+	(data->redis_inst->redis_finish_query)(dissocket);
+
+
+	fr_ipaddr_t ipaddr;
+	uint32_t ip_allocation;
+	ip_hton(ip_str, AF_INET, &ipaddr);
+	ip_allocation = ipaddr.ipaddr.ip4addr.s_addr;
+
+	vp = radius_paircreate(request, &request->reply->vps,PW_FRAMED_IP_ADDRESS, PW_TYPE_IPADDR);
+	vp->vp_ipaddr = ip_allocation;
+
+	RDEBUG("Allocated IP %s [%08x]", ip_str, ip_allocation);
+
+	data->redis_inst->redis_release_socket(data->redis_inst, dissocket);
 
 	return RLM_MODULE_OK;
 }
