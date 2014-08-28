@@ -187,18 +187,14 @@ static int redis_ippool_instantiate(CONF_SECTION *conf, void **instance)
 	modinst = find_module_instance(cf_section_find("modules"),
 				       inst->redis_instance_name, 1);
 	if (!modinst) {
-		radlog(L_ERR,
-		       "redis_ippool: failed to find module instance \"%s\"",
-		       inst->redis_instance_name);
+		radlog(L_ERR, "redis_ippool: failed to find module instance \"%s\"", inst->redis_instance_name);
 
 		redis_ippool_detach(inst);
 		return -1;
 	}
 
 	if (strcmp(modinst->entry->name, "rlm_redis") != 0) {
-		radlog(L_ERR, "redis_ippool: Module \"%s\""
-		       " is not an instance of the redis module",
-		       inst->redis_instance_name);
+		radlog(L_ERR, "redis_ippool: Module \"%s\" is not an instance of the redis module", inst->redis_instance_name);
 
 		redis_ippool_detach(inst);
 		return -1;
@@ -289,11 +285,15 @@ static int redis_ippool_post_auth(void * instance, REQUEST * request)
 	if (pairfind(request->reply->vps, PW_FRAMED_IP_ADDRESS) != NULL) {
 		RDEBUG("Framed-IP-Address already exists");
 
+		radlog(L_INFO,"Framed-IP-Address already exists");
+
 		return RLM_MODULE_NOOP;
 	}
 
 	if ((vp = pairfind(request->config_items, PW_POOL_NAME)) == NULL) {
 		RDEBUG("No Pool-Name defined");
+
+		radlog(L_INFO,"No Pool-Name defined");
 
 		return RLM_MODULE_NOOP;
 	}
@@ -302,7 +302,8 @@ static int redis_ippool_post_auth(void * instance, REQUEST * request)
 
 	dissocket = data->redis_inst->redis_get_socket(data->redis_inst);
 	if (dissocket == NULL) {
-		RDEBUG("cannot allocate redis connection");
+		RDEBUG("Cannot allocate redis connection");
+		radlog(L_ERR,"Cannot allocate redis connection");
 		return RLM_MODULE_FAIL;
 	}
 
@@ -311,7 +312,7 @@ static int redis_ippool_post_auth(void * instance, REQUEST * request)
 
 	if (dissocket->reply->type == 4){ // 4 == REDIS_REPLY_NIL
 		RDEBUG("Pool with name '%s' not found",pool_name);
-
+		radlog(L_INFO,"Pool with name '%s' not found",pool_name);
 		return RLM_MODULE_NOOP;
 	}
 
@@ -321,7 +322,7 @@ static int redis_ippool_post_auth(void * instance, REQUEST * request)
 	int iprange_parsed = sscanf(pool_ip_range, "%d.%d.%d.%d %d.%d.%d.%d", start, start+1, start+2, start+3, end, end+1, end+2, end+3);
 	if (iprange_parsed != 8){
 		RDEBUG("'%s' ip range is invalid",pool_name);
-
+		radlog(L_INFO,"'%s' ip range is invalid",pool_name);
 		return RLM_MODULE_NOOP;
 	}
 
@@ -339,7 +340,7 @@ static int redis_ippool_post_auth(void * instance, REQUEST * request)
 		return 0;
 	}
 
-	RDEBUG("ip-key is: %s", ip_key_str);
+	RDEBUG("ip-key is %s", ip_key_str);
 
 	long ip_key;
 	sscanf(ip_key_str, "%ld", &ip_key);
@@ -358,13 +359,14 @@ static int redis_ippool_post_auth(void * instance, REQUEST * request)
 			break;
 		}else{
 			ip_key += rand();
-			RDEBUG("collision detected. change ip-key to: %ld", ip_key);
+			RDEBUG("collision detected. change ip-key to %ld", ip_key);
 			ip_key %= range_length;
 		}
 	}
 
 	if (!ip_found){
 		RDEBUG("Failed to find free ip from pool '%s'",pool_name);
+		radlog(L_ERR,"Failed to find free ip from pool '%s'",pool_name);
 		return RLM_MODULE_FAIL;
 	}
 
@@ -386,6 +388,7 @@ static int redis_ippool_post_auth(void * instance, REQUEST * request)
 	vp->vp_ipaddr = ip_allocation;
 
 	RDEBUG("Allocated IP %s [%08x]", ip_str, ip_allocation);
+	radlog(L_INFO,"Allocated IP %s from %s", ip_str, pool_name);
 
 	data->redis_inst->redis_release_socket(data->redis_inst, dissocket);
 
