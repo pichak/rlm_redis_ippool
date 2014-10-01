@@ -3,7 +3,7 @@
 #  $Id: e16550c9991a5e76a77f349cfa5b82d5163f172e $
 
 #
-#  Configuration file for the "rediswho" module.
+#  Configuration file for the "redis_ippool" module.
 #
 redis_ippool {
 
