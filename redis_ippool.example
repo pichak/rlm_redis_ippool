@@ -25,5 +25,3 @@ redis_ippool {
 	deallocate = "DEL \"%{NAS-IP-Address}_%{Framed-IP-Address}\""
 }
 
-
-SET expire_pool "10.13.0.0 10.13.255.255"
